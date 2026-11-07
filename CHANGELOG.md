@@ -9,5 +9,5 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Initial release of trysac-fx-rates-cache with Decimal arithmetic, bounded LRU cache, and weekend lookback.
+- Initial release of trysac-fx-rates-cache providing pluggable FX conversions, bounded LRU caching, and lookback.
 - Initial project structure from the factory utility template.

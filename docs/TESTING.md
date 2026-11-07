@@ -2,19 +2,14 @@
 
 ## Running
 
-```sh
-uv run pytest --cov=fx_rates_cache   # tests with coverage report
-uv run python scripts/check.py      # every gate, as CI and the factory run it
-```
+`uv run pytest --cov=fx_rates_cache`
 
 ## Policy
 
-- Branch coverage of `src/fx_rates_cache` must stay at or above 80 %; the gate fails below it.
-- Tests exercise the public API (`import fx_rates_cache`) and assert every observable effect:
-  return values, raised exceptions and their messages.
-- Each bug fix starts with a failing test that reproduces it.
-- Tests are deterministic: no network, no wall clock, no dependence on test order.
+- Branch coverage must remain >= 80%.
+- Tests exercise the public API (`import fx_rates_cache`) and assert every observable effect: return values, raised exceptions, and error messages.
+- Deterministic: no network, no wall clock, no dependence on test order.
 
 ## Layout
 
-`tests/test_<module>.py` mirrors each public module. Shared fixtures go in `tests/conftest.py`.
+`tests/test_fx_rates_cache.py`: Covers acceptance criteria (source rates, lookback logic, cache LRU, validations, exception propagation). Shared fixtures reside in `tests/conftest.py`.

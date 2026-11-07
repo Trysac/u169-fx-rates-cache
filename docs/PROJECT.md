@@ -2,40 +2,34 @@
 
 ## Objective
 
-Convert amounts between currencies with Decimal using dated rates from a pluggable source, bounded LRU caching, weekend lookback and cross rates through the base
+Convert amounts between currencies with Decimal using dated rates from a pluggable source, bounded LRU caching, weekend lookback and cross rates through the base.
 
 ## Scope
 
-- In scope: the public API documented in [README.md](../README.md), typed and tested.
-- Out of scope: anything that needs runtime dependencies or I/O without an accepted ADR.
+- Public API documented in README.md, typed and tested.
 
-## Timeline
+## Out of Scope
 
-| Date | Event |
-|---|---|
-| 2026 | Repository created from the factory utility template. |
+- Shipping a real network rates provider.
+- Minor-unit conversion tables.
+- Historical bulk loading.
+- Bid and ask spreads.
 
 ## Effort metrics
 
-Measured values only; a value that has not been measured stays "pending measurement".
-
 | Metric | Value |
 |---|---|
-| Tokens (input / output) | 1169123 / 28090 |
+| Tokens (input / output) | 371240 / 12185 |
 | Hours (human) | pending measurement |
-| Cost (USD) | 0.1725 |
+| Cost (USD) | 0.0932 |
 
-## Factory run u169 (measured from API usage)
+## Factory run u169b (measured from API usage)
 
 | Phase | Model | Batch | Input | Output | Cache write | Cache read | Cost (USD) |
 |---|---|---|---|---|---|---|---|
-| generation | gemini-3.8-flash | yes | 4103 | 627 | 0 | 0 | 0.0027 |
-| generation | gemini-3.8-flash | yes | 4103 | 9456 | 0 | 0 | 0.0193 |
-| generation | gemini-3.8-flash | yes | 4137 | 9705 | 0 | 0 | 0.0197 |
-| fix-1 | gemini-3.1-flash-lite | no | 26380 | 1569 | 0 | 34461 | 0.0098 |
-| fix-2 | gemini-3.1-flash-lite | no | 101186 | 2931 | 0 | 582239 | 0.0442 |
-| fix-3 | gemini-3.1-flash-lite | no | 48542 | 1349 | 0 | 140586 | 0.0177 |
-| fix-4 | gemini-3.1-flash-lite | no | 16966 | 623 | 0 | 2004 | 0.0052 |
-| docs | gemini-3.1-flash-lite | no | 204416 | 1830 | 0 | 0 | 0.0538 |
+| generation | gemini-3.8-flash | yes | 4137 | 9572 | 0 | 0 | 0.0195 |
+| fix-1 | gemini-3.1-flash-lite | no | 20455 | 913 | 0 | 12196 | 0.0068 |
+| audit | gemini-3.1-flash-lite | no | 37228 | 176 | 0 | 85506 | 0.0117 |
+| docs | gemini-3.1-flash-lite | no | 211718 | 1524 | 0 | 0 | 0.0552 |
 
-Total: $0.1725. Prices: Anthropic list prices.
+Total: $0.0932. Prices: Anthropic list prices.
