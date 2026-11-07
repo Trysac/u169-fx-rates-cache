@@ -1,19 +1,17 @@
-# Security notes
+# Security Policy
 
-## Threat model
+## Threat Model
 
-`trysac-fx-rates-cache` is a pure library without I/O. The main risks are:
+1. **DoS via Unbounded Growth**:
+   - Mitigated by `max_entries` cache bound and `max_lookback_days` limit (0-31).
 
-- **Supply chain**: a compromised dependency or CI action. Mitigation: no runtime dependencies,
-  Dependabot weekly updates, actions pinned to major versions, minimal workflow permissions.
-- **Leaked secrets**: tokens committed by mistake. Mitigation: `gitleaks` runs in the local gates
-  and in CI; `.env` files are git-ignored.
-- **Untrusted input**: callers may pass hostile strings. Mitigation: validate input and fail with
-  explicit exceptions; never `eval`, `exec` or deserialize untrusted data.
+2. **Numeric Precision Hazards**:
+   - Floating-point inputs are explicitly rejected (only `Decimal` or `int` allowed).
+   - Arithmetic is strictly handled with `Decimal` (prec=28).
 
-## Publishing
+3. **Information Leakage**:
+   - Error messages are truncated to 200 characters and contain no sensitive data.
 
-Releases are published to PyPI with trusted publishing (OIDC) when available, never with a
-long-lived token stored in the repository.
-
-To report a vulnerability, see [SECURITY.md](../SECURITY.md).
+## Limits
+- The library does not perform network I/O; security of the `RateSource` implementation is the user's responsibility.
+- No global mutable state is used; logging uses `NullHandler`.

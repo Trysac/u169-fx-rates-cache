@@ -1,16 +1,16 @@
-"""Convert amounts between currencies with Decimal using dated rates from a pluggable source."""
+"""Pluggable FX conversion with Decimal precision, bounded LRU caching, and lookback."""
 
 from __future__ import annotations
 
 import datetime
-import decimal
 import logging
 import re
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from decimal import Decimal, localcontext
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
 from typing import Literal, Protocol, runtime_checkable
 
 __all__ = [
@@ -27,9 +27,9 @@ __version__ = "0.1.0"
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-_CURRENCY_CODE_RE = re.compile(r"^[A-Z]{3}$")
+CURRENCY_CODE_RE = re.compile(r"^[A-Z]{3}$")
 
-ErrorCode = Literal[
+FxErrorCode = Literal[
     "invalid_currency",
     "invalid_amount",
     "invalid_rate",
@@ -39,33 +39,31 @@ ErrorCode = Literal[
 
 
 class FxError(Exception):
-    """Base exception raised for foreign exchange errors."""
+    """Base error class for FX conversion operations."""
 
-    def __init__(self, code: ErrorCode, message: str | None = None) -> None:
-        super().__init__(message or code)
-        self.code: ErrorCode = code
+    def __init__(self, code: FxErrorCode, message: str | None = None) -> None:
+        self.code = code
+        msg = message or f"FX operation failed with code: {code}"
+        # Limit error message length to avoid leaking huge payloads
+        super().__init__(msg[:200])
 
 
 class RateNotAvailable(Exception):
-    """Raised by RateSource when no publication exists for a requested date."""
+    """Raised by a RateSource when no publication exists for the requested day."""
 
 
 @runtime_checkable
 class RateSource(Protocol):
-    """Pluggable protocol for fetching exchange rates relative to a base currency."""
+    """Protocol for rates providers."""
 
     def fetch(self, day: datetime.date, base: str) -> Mapping[str, Decimal]:
-        """Fetch rates for given day and base currency.
-
-        Raises:
-            RateNotAvailable: When that day has no publication.
-        """
+        """Fetch rates for given day expressed as units of currency per 1 base currency."""
         ...
 
 
 @dataclass(frozen=True)
 class Conversion:
-    """Immutable result of a currency conversion."""
+    """Result of an FX conversion."""
 
     amount: Decimal
     rate: Decimal
@@ -74,15 +72,8 @@ class Conversion:
     to_ccy: str
 
 
-@dataclass(frozen=True)
-class _CacheEntry:
-    rates: dict[str, Decimal]
-    rate_date: datetime.date
-    fetched_at: float
-
-
 class FxConverter:
-    """Currency converter using Decimal arithmetic and bounded LRU caching."""
+    """Converts currency amounts using dated rates from a pluggable RateSource."""
 
     def __init__(
         self,
@@ -93,126 +84,112 @@ class FxConverter:
         ttl_s: float = 3600.0,
         max_lookback_days: int = 7,
         today: Callable[[], datetime.date] = datetime.date.today,
-        monotonic: Callable[[], float] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        import time
-
-        if not isinstance(base, str) or not _CURRENCY_CODE_RE.match(base):
-            raise FxError("invalid_currency", f"Invalid base currency code: {base!r}")
-        if not isinstance(max_entries, int) or isinstance(max_entries, bool) or max_entries < 1:
-            raise FxError("invalid_config", "max_entries must be an integer >= 1")
-        if isinstance(ttl_s, bool) or not isinstance(ttl_s, (int, float)) or ttl_s < 0:
-            raise FxError("invalid_config", "ttl_s must be a non-negative number")
-        if (
-            isinstance(max_lookback_days, bool)
-            or not isinstance(max_lookback_days, int)
-            or not (0 <= max_lookback_days <= 31)
-        ):
-            raise FxError(
-                "invalid_config",
-                "max_lookback_days must be an integer between 0 and 31",
-            )
+        self._validate_currency_code(base)
+        if max_entries < 1:
+            raise FxError("invalid_config", "max_entries must be at least 1")
+        if ttl_s < 0:
+            raise FxError("invalid_config", "ttl_s must be non-negative")
+        if not (0 <= max_lookback_days <= 31):
+            raise FxError("invalid_config", "max_lookback_days must be between 0 and 31")
 
         self._source = source
         self._base = base
         self._max_entries = max_entries
-        self._ttl_s = float(ttl_s)
+        self._ttl_s = ttl_s
         self._max_lookback_days = max_lookback_days
         self._today = today
-        self._monotonic = monotonic or time.monotonic
+        self._monotonic = monotonic
 
-        self._cache: OrderedDict[tuple[datetime.date, str], _CacheEntry] = OrderedDict()
+        # Cache maps (day: date, base: str) -> (rates: dict[str, Decimal],
+        # rate_date: date, fetched_at: float)
+        self._cache: OrderedDict[
+            tuple[datetime.date, str], tuple[dict[str, Decimal], datetime.date, float]
+        ] = OrderedDict()
         self._lock = threading.Lock()
 
-    @property
-    def base(self) -> str:
-        """Default base currency used for fetching rates."""
-        return self._base
+    @staticmethod
+    def _validate_currency_code(code: str) -> None:
+        if not isinstance(code, str) or not CURRENCY_CODE_RE.match(code):
+            raise FxError("invalid_currency", f"Invalid currency code: {code!r}")
 
-    def _validate_currency(self, ccy: str) -> None:
-        if not isinstance(ccy, str) or not _CURRENCY_CODE_RE.match(ccy):
-            preview = str(ccy)[:200]
-            raise FxError("invalid_currency", f"Invalid currency code: {preview!r}")
-
-    def _validate_amount(self, amount: Decimal | int) -> Decimal:
-        if isinstance(amount, bool) or not isinstance(amount, (Decimal, int)):
-            preview = str(amount)[:200]
-            raise FxError("invalid_amount", f"Amount must be Decimal or int, got {preview!r}")
-        dec_val = Decimal(amount)
-        if not dec_val.is_finite():
-            raise FxError("invalid_amount", "Amount must be finite")
-        return dec_val
-
-    def _validate_rates(self, raw_rates: Mapping[str, Decimal]) -> dict[str, Decimal]:
-        if not isinstance(raw_rates, Mapping):
-            raise FxError("invalid_rate", "Source returned non-mapping rates")
-
-        cleaned: dict[str, Decimal] = {}
-        for ccy, rate in raw_rates.items():
-            if not isinstance(ccy, str) or not _CURRENCY_CODE_RE.match(ccy):
-                raise FxError("invalid_currency", f"Invalid currency in rates: {ccy!r}")
-            if isinstance(rate, bool) or not isinstance(rate, Decimal):
-                raise FxError("invalid_rate", f"Rate for {ccy} must be Decimal")
-            if not rate.is_finite() or rate <= Decimal("0"):
-                raise FxError("invalid_rate", f"Rate for {ccy} must be finite and > 0")
-            cleaned[ccy] = rate
-        return cleaned
-
-    def _get_rates_with_cache(self, on: datetime.date) -> tuple[dict[str, Decimal], datetime.date]:
-        cache_key = (on, self._base)
-        now_mono = self._monotonic()
-        current_today = self._today()
-
-        with self._lock:
-            entry = self._cache.get(cache_key)
-            if entry is not None:
-                is_today_or_future = on >= current_today
-                is_expired = is_today_or_future and (now_mono - entry.fetched_at >= self._ttl_s)
-                if not is_expired:
-                    self._cache.move_to_end(cache_key)
-                    return entry.rates, entry.rate_date
-
-        # Cache miss or expired: fetch without holding lock across source call
-        probed_dates: list[datetime.date] = []
-        published_rates: dict[str, Decimal] | None = None
-        published_date: datetime.date | None = None
-
-        for offset in range(self._max_lookback_days + 1):
-            day_to_try = on - datetime.timedelta(days=offset)
-            probed_dates.append(day_to_try)
-            try:
-                raw = self._source.fetch(day_to_try, self._base)
-            except RateNotAvailable:
-                continue
-            except Exception:
-                raise
-
-            published_rates = self._validate_rates(raw)
-            published_date = day_to_try
-            break
-
-        if published_rates is None or published_date is None:
+    @staticmethod
+    def _validate_amount(amount: Decimal | int) -> Decimal:
+        # Ensure bool is rejected since bool is a subclass of int in Python
+        if isinstance(amount, (bool, float)):
             raise FxError(
-                "rate_unavailable",
-                f"No exchange rates available for {on} (lookback={self._max_lookback_days})",
+                "invalid_amount", f"Amount must be Decimal or int, got {type(amount).__name__}"
             )
-
-        fetched_at = self._monotonic()
-        cached_entry = _CacheEntry(
-            rates=published_rates,
-            rate_date=published_date,
-            fetched_at=fetched_at,
+        if isinstance(amount, int):
+            return Decimal(amount)
+        if isinstance(amount, Decimal):
+            if not amount.is_finite():
+                raise FxError("invalid_amount", "Amount must be a finite Decimal")
+            return amount
+        raise FxError(
+            "invalid_amount", f"Amount must be Decimal or int, got {type(amount).__name__}"
         )
 
-        with self._lock:
-            for probed_day in probed_dates:
-                k = (probed_day, self._base)
-                self._cache[k] = cached_entry
-                self._cache.move_to_end(k)
-                while len(self._cache) > self._max_entries:
-                    self._cache.popitem(last=False)
+    def _validate_rates(self, rates: Mapping[str, Decimal]) -> dict[str, Decimal]:
+        validated: dict[str, Decimal] = {}
+        for ccy, rate in rates.items():
+            self._validate_currency_code(ccy)
+            if isinstance(rate, bool) or not isinstance(rate, Decimal):
+                raise FxError(
+                    "invalid_rate", f"Rate for {ccy} must be Decimal, got {type(rate).__name__}"
+                )
+            if not rate.is_finite() or rate <= 0:
+                raise FxError("invalid_rate", f"Rate for {ccy} must be finite and positive: {rate}")
+            validated[ccy] = rate
+        return validated
 
-        return published_rates, published_date
+    def _get_rates_and_date(self, on: datetime.date) -> tuple[dict[str, Decimal], datetime.date]:
+        cache_key = (on, self._base)
+        now = self._monotonic()
+        current_day = self._today()
+
+        with self._lock:
+            if cache_key in self._cache:
+                entry_rates, rate_date, fetched_at = self._cache[cache_key]
+                # Expire if day is today or in future and ttl_s elapsed
+                if on >= current_day and (now - fetched_at) >= self._ttl_s:
+                    # Expired, remove from cache
+                    del self._cache[cache_key]
+                else:
+                    self._cache.move_to_end(cache_key)
+                    return entry_rates, rate_date
+
+        # Cache miss or expired: fetch without holding lock (allows concurrent
+        # source calls as documented)
+        probed_dates: list[datetime.date] = []
+        published_rates: dict[str, Decimal] | None = None
+        effective_date: datetime.date | None = None
+
+        for day_offset in range(self._max_lookback_days + 1):
+            probe_day = on - datetime.timedelta(days=day_offset)
+            probed_dates.append(probe_day)
+            try:
+                raw_rates = self._source.fetch(probe_day, self._base)
+                published_rates = self._validate_rates(raw_rates)
+                effective_date = probe_day
+                break
+            except RateNotAvailable:
+                continue
+
+        if published_rates is None or effective_date is None:
+            raise FxError("rate_unavailable", f"No rates published for {on} within lookback window")
+
+        fetched_at = self._monotonic()
+        with self._lock:
+            for probed in probed_dates:
+                k = (probed, self._base)
+                self._cache[k] = (published_rates, effective_date, fetched_at)
+                self._cache.move_to_end(k)
+            while len(self._cache) > self._max_entries:
+                self._cache.popitem(last=False)
+
+        return published_rates, effective_date
 
     def convert(
         self,
@@ -223,38 +200,41 @@ class FxConverter:
         on: datetime.date,
         places: int | None = None,
     ) -> Conversion:
-        """Convert an amount from one currency to another on a given date."""
-        self._validate_currency(from_ccy)
-        self._validate_currency(to_ccy)
-        dec_amount = self._validate_amount(amount)
-
-        if places is not None and (
-            isinstance(places, bool) or not isinstance(places, int) or not (0 <= places <= 8)
+        """Convert amount from from_ccy to to_ccy on the specified date."""
+        if places is not None and not (
+            isinstance(places, int) and not isinstance(places, bool) and 0 <= places <= 8
         ):
             raise FxError("invalid_config", "places must be an integer between 0 and 8")
 
+        self._validate_currency_code(from_ccy)
+        self._validate_currency_code(to_ccy)
+        dec_amount = self._validate_amount(amount)
+
         if from_ccy == to_ccy:
             rate = Decimal("1")
-            with localcontext() as ctx:
-                ctx.prec = 28
-                ctx.rounding = decimal.ROUND_HALF_EVEN
-                calc_amount = dec_amount * rate
-                if places is not None:
-                    calc_amount = calc_amount.quantize(Decimal(1).scaleb(-places))
+            rate_date = on
+            converted_amount = dec_amount * rate
+            if places is not None:
+                with localcontext() as ctx:
+                    ctx.prec = 28
+                    ctx.rounding = ROUND_HALF_EVEN
+                    scale = Decimal(1).scaleb(-places)
+                    converted_amount = converted_amount.quantize(scale)
             return Conversion(
-                amount=calc_amount,
+                amount=converted_amount,
                 rate=rate,
-                rate_date=on,
+                rate_date=rate_date,
                 from_ccy=from_ccy,
                 to_ccy=to_ccy,
             )
 
-        rates, effective_date = self._get_rates_with_cache(on)
+        rates, rate_date = self._get_rates_and_date(on)
 
         with localcontext() as ctx:
             ctx.prec = 28
-            ctx.rounding = decimal.ROUND_HALF_EVEN
+            ctx.rounding = ROUND_HALF_EVEN
 
+            # Resolve rate
             if from_ccy == self._base:
                 if to_ccy not in rates:
                     raise FxError(
@@ -266,26 +246,25 @@ class FxConverter:
                     raise FxError(
                         "rate_unavailable", f"Source currency {from_ccy} missing from rates"
                     )
-                rate = Decimal("1") / rates[from_ccy]
+                rate = Decimal(1) / rates[from_ccy]
             else:
-                if from_ccy not in rates:
-                    raise FxError(
-                        "rate_unavailable", f"Source currency {from_ccy} missing from rates"
-                    )
-                if to_ccy not in rates:
-                    raise FxError(
-                        "rate_unavailable", f"Target currency {to_ccy} missing from rates"
-                    )
+                if from_ccy not in rates or to_ccy not in rates:
+                    missing = from_ccy if from_ccy not in rates else to_ccy
+                    raise FxError("rate_unavailable", f"Currency {missing} missing from rates")
                 rate = rates[to_ccy] / rates[from_ccy]
 
-            calc_amount = dec_amount * rate
+            converted_amount = dec_amount * rate
             if places is not None:
-                calc_amount = calc_amount.quantize(Decimal(1).scaleb(-places))
+                try:
+                    scale = Decimal(1).scaleb(-places)
+                    converted_amount = converted_amount.quantize(scale)
+                except InvalidOperation as exc:
+                    raise FxError("invalid_amount", "Quantization failed") from exc
 
         return Conversion(
-            amount=calc_amount,
+            amount=converted_amount,
             rate=rate,
-            rate_date=effective_date,
+            rate_date=rate_date,
             from_ccy=from_ccy,
             to_ccy=to_ccy,
         )

@@ -1,61 +1,46 @@
 # fx-rates-cache
 
-Convert amounts between currencies with `Decimal` using dated rates from a pluggable source, bounded LRU caching, weekend lookback, and cross rates through a base currency.
+![Build Status](https://github.com/u169-fx-rates-cache/actions/workflows/ci.yml/badge.svg)
 
-## Features
+Applications that convert money often call rates APIs repeatedly, rely on floating-point arithmetic, and ignore that rates are published per business day. This library converts amounts with 28-digit Decimal precision, uses a pluggable source for rates, caches results by date, transparently resolves non-publishing days (weekends/holidays) via a configurable lookback, and reports the effective rate date.
 
-- **Decimal-Only Arithmetic**: Prevents floating-point rounding errors in financial computations.
-- **Pluggable Source**: Clean `RateSource` protocol easily adapted to any rates API (ECB, Fed, commercial).
-- **Exact Rate Tracking**: Every conversion includes the exact `rate_date` used.
-- **Weekend and Holiday Lookback**: Automatically falls back to previous business days when rates are unpublished.
-- **Bounded LRU Cache**: In-memory thread-safe `OrderedDict` with TTL expiration for current-day rates and permanent caching for historical dates.
+## Installation
 
-## Usage Example
+`pip install fx-rates-cache`
+
+## Usage
 
 ```python
-import datetime
 from decimal import Decimal
+import datetime
 from fx_rates_cache import FxConverter
 
 
-class DailySource:
-    def fetch(self, day: datetime.date, base: str):
-        return {"USD": Decimal("1.0800"), "GBP": Decimal("0.8500")}
-
-
-converter = FxConverter(DailySource(), base="EUR")
-res = converter.convert(Decimal("100"), "EUR", "USD", on=datetime.date(2026, 11, 6))
-print(f"{res.amount} {res.to_ccy} on {res.rate_date}")
-```
-
-## European Central Bank (ECB) XML Adapter Example
-
-```python
-import datetime
-from decimal import Decimal
-import xml.etree.ElementTree as ET
-import urllib.request
-from fx_rates_cache import RateNotAvailable, RateSource
-
-
-class EcbDailySource(RateSource):
-    URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
-    NS = {
-        "gesmes": "http://www.gesmes.org/xml/2002-08-01",
-        "ecb": "http://www.ecb.int/vocabulary/2002-08-01/eurofxref",
-    }
-
+class Source:
     def fetch(self, day: datetime.date, base: str) -> dict[str, Decimal]:
-        if base != "EUR":
-            raise RateNotAvailable("ECB base currency is EUR")
-        with urllib.request.urlopen(self.URL) as resp:
-            tree = ET.parse(resp)
-        root = tree.getroot()
-        cube_time = root.find(".//ecb:Cube[@time]", self.NS)
-        if cube_time is None or cube_time.attrib["time"] != day.isoformat():
-            raise RateNotAvailable(f"Rates for {day} not found in daily XML")
-        rates = {}
-        for cube in cube_time.findall("ecb:Cube", self.NS):
-            rates[cube.attrib["currency"]] = Decimal(cube.attrib["rate"])
-        return rates
+        return {"USD": Decimal("1.0800")}
+
+
+conv = FxConverter(Source(), base="EUR")
+res = conv.convert(Decimal("100"), "EUR", "USD", on=datetime.date(2026, 11, 6))
+print(res.amount)
 ```
+
+## API Summary
+
+### Errors
+- `FxError`: Raised for `invalid_currency`, `invalid_amount`, `invalid_rate`, `rate_unavailable`, `invalid_config`.
+
+### Options & Limits
+- `max_entries`: Bounded LRU cache size (default 1,000, must be >= 1).
+- `max_lookback_days`: Lookback range (0-31 days).
+- `ttl_s`: Expiration in seconds for current-day entries (default 3600.0).
+- `places`: Optional quantization (0-8 digits) using `ROUND_HALF_EVEN`.
+
+## Why not forex-python?
+
+This library is offline-testable, uses `Decimal` only (no floats), explicitly reports the effective rate date used for conversion, and includes a bounded cache to prevent memory growth.
+
+## Security
+
+See [docs/SECURITY.md](docs/SECURITY.md).
