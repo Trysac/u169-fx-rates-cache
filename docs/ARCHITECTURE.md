@@ -1,29 +1,27 @@
 # Architecture
 
-## Purpose
+`fx-rates-cache` handles currency conversion and rate caching without floating point drift or unrecorded rate dates.
 
-`trysac-fx-rates-cache` is a small, dependency-free Python library: Convert amounts between currencies with Decimal using dated rates from a pluggable source, bounded LRU caching, weekend lookback and cross rates through the base
+## Key Design Aspects
 
-## Shape
+1. **RateSource Protocol**:
+   - Decoupled from any network or HTTP library.
+   - Contract: `fetch(day: date, base: str) -> Mapping[str, Decimal]`.
+   - Raises `RateNotAvailable` when no rates were published on that date.
 
-```text
-caller code --> fx_rates_cache (public API in __init__.py)
-                    |
-                    +-- pure functions, no I/O, no global state
-```
+2. **Triangulation via Base Currency**:
+   - Converting from Base to Target: `rate = rates[target]`
+   - Converting from Source to Base: `rate = 1 / rates[source]`
+   - Converting between Non-Base Currencies: `rate = rates[target] / rates[source]`
+   - Identity: `from_ccy == to_ccy` returns rate `1` without querying the source.
 
-- **Public API**: the names listed in `__all__` of `src/fx_rates_cache/__init__.py`. Anything else is
-  internal and may change without a major version.
-- **Errors**: invalid input raises built-in exceptions (`ValueError`, `TypeError`) with a clear
-  message; the library never prints or exits.
-- **Side effects**: none. If a feature needs I/O, isolate it in its own module behind a small
-  interface and record the choice in an ADR.
+3. **Local Decimal Context**:
+   - All computations run within a thread-local decimal context: `prec=28` and `ROUND_HALF_EVEN`.
+   - Quantization is applied only if `places` is explicitly requested (0 to 8).
 
-## Quality contract
-
-`scripts/check.py` is the single definition of the gates; `fabrica.json` tells the factory and CI
-how to run it. See [TESTING.md](TESTING.md).
-
-## Decisions
-
-Architecture decisions are recorded in [decisions/](decisions/) as numbered ADRs.
+4. **Bounded Thread-Safe LRU Cache**:
+   - `_cache` is an `OrderedDict` keyed by `(day, base)`.
+   - Historical entries (`day < today()`) never expire.
+   - Current and future entries (`day >= today()`) expire when `monotonic() - fetched_at >= ttl_s`.
+   - Lookback caching: all probed non-published days share the cached result under their respective date keys.
+   - Guarded by a `threading.Lock`.
